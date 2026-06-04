@@ -1,4 +1,3 @@
-import math
 import os
 import sys
 
@@ -16,15 +15,20 @@ import softmax_online_ext
 import softmax_warp_ext
 
 
-# ---- Simple configuration ----
-ROWS = 4096           # batch size
-COLS = 6              # number of classes (HAR has 6 activities)
+# ---- Benchmark configuration ----
 WARMUP_ITERS = 10
-BENCH_ITERS = 100
+BENCH_ITERS = 120
 
-# NVIDIA T4 (Google Colab) reference values
-PEAK_BW_BYTES = 320e9     # ~320 GB/s
-PEAK_FLOPS = 8.1e12       # ~8.1 TFLOPS (FP32)
+# (rows, cols) shapes to sweep
+SHAPES = [
+    (256, 6),
+    (1024, 6),
+    (4096, 6),
+    (16384, 6),
+    (4096, 128),
+    (4096, 512),
+    (4096, 1024),
+]
 
 
 def time_kernel(fn, x):
@@ -47,26 +51,72 @@ def time_kernel(fn, x):
     return (ms / 1000.0) / BENCH_ITERS
 
 
-def estimate_bytes_moved(rows, cols):
-    # Simple approximation: 2 reads + 1 write of float32 data
-    elements = rows * cols
-    return elements * 4 * 3
-
-
 def estimate_flops(rows, cols):
-    # Simple approximation: exp + add + exp + div per element ~ 4 FLOPs
-    elements = rows * cols
-    return elements * 4
+    # Rough softmax cost per row:
+    # 1) max reduction: (cols - 1) comparisons
+    # 2) exp + sum: cols exp + (cols - 1) adds
+    # 3) normalize: cols divs
+    # 4) subtract max before exp: cols subs
+    # Treat comparisons as 1 FLOP for roofline simplicity.
+    flops_per_row = (cols - 1) + cols + (cols - 1) + cols + cols
+    return rows * flops_per_row
+
+
+def estimate_bytes(rows, cols):
+    # Simple traffic model that varies with columns:
+    # - Two full reads of input (max pass + exp/sum pass)
+    # - One full write of output
+    # - Two scalars per row (max + sum) as reduction overhead
+    bytes_per_row = (3 * cols + 2) * 4
+    return rows * bytes_per_row
+
+
+def fp32_cores_per_sm(major, minor):
+    # Minimal mapping for common architectures (enough for T4 in Colab)
+    if (major, minor) == (7, 5):  # T4
+        return 64
+    if (major, minor) == (7, 0):  # V100
+        return 64
+    if (major, minor) == (8, 0):  # A100
+        return 64
+    if (major, minor) == (8, 6):  # RTX 30xx / A10
+        return 128
+    if (major, minor) == (9, 0):  # H100
+        return 128
+    # Reasonable fallback for unknown GPUs
+    return 64
+
+
+def device_roofline_limits():
+    # Compute theoretical roofline limits from device properties
+    props = torch.cuda.get_device_properties(0)
+
+    # Peak FP32 throughput (GFLOP/s)
+    sm_count = props.multi_processor_count
+    core_count = fp32_cores_per_sm(props.major, props.minor)
+    clock_hz = props.clock_rate * 1e3  # kHz -> Hz
+    peak_gflops = (sm_count * core_count * 2 * clock_hz) / 1e9
+
+    # Memory bandwidth (GB/s)
+    mem_clock = getattr(props, "memory_clock_rate", None)
+    bus_width = getattr(props, "memory_bus_width", None)
+    if mem_clock is None or bus_width is None:
+        if "T4" in props.name:
+            bandwidth_gb_s = 320.0
+            print("Using default T4 memory bandwidth: 320 GB/s.")
+        else:
+            raise RuntimeError("Cannot infer memory bandwidth from device properties.")
+    else:
+        mem_clock_hz = mem_clock * 1e3  # kHz -> Hz
+        bandwidth_gb_s = (mem_clock_hz * (bus_width / 8) * 2) / 1e9
+
+    return peak_gflops, bandwidth_gb_s, props.name
 
 
 def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this benchmark.")
 
-    # Input tensor for benchmarking
-    x = torch.randn(ROWS, COLS, device="cuda", dtype=torch.float32)
-
-    # Define all kernels to test (including PyTorch softmax)
     kernels = [
         ("naive_cuda", softmax_naive_ext.forward),
         ("shared_memory", softmax_shared_ext.forward),
@@ -75,41 +125,78 @@ def main():
         ("pytorch_softmax", lambda t: torch.softmax(t, dim=-1)),
     ]
 
-    # Collect results
-    results = []
-    bytes_moved = estimate_bytes_moved(ROWS, COLS)
-    flops = estimate_flops(ROWS, COLS)
-    oi = flops / bytes_moved
+    peak_gflops, bandwidth_gb_s, device_name = device_roofline_limits()
 
-    for name, fn in kernels:
-        seconds = time_kernel(fn, x)
-        bandwidth = bytes_moved / seconds
-        perf = flops / seconds
-        pct_peak = (bandwidth / PEAK_BW_BYTES) * 100.0
-        results.append((name, bandwidth, pct_peak, perf))
+    # Collect results: {kernel_name: [(shape, ai, gflops), ...]}
+    results = {name: [] for name, _ in kernels}
 
-    # Print a Markdown table with bandwidth and % peak
-    print("\n| Kernel | Bandwidth (GB/s) | % Peak BW |")
-    print("|---|---:|---:|")
-    for name, bandwidth, pct_peak, _ in results:
-        print(f"| {name} | {bandwidth/1e9:.2f} | {pct_peak:.2f}% |")
+    for rows, cols in SHAPES:
+        x = torch.randn(rows, cols, device="cuda", dtype=torch.float32)
+        flops = estimate_flops(rows, cols)
+        bytes_moved = estimate_bytes(rows, cols)
+        ai = flops / bytes_moved  # FLOPs per byte
 
-    # ---- Roofline plot ----
-    # Roofline: performance = min(peak_flops, peak_bw * OI)
-    oi_vals = [1e-3, 1e2]
-    roofline = [min(PEAK_FLOPS, PEAK_BW_BYTES * x) for x in oi_vals]
+        for name, fn in kernels:
+            seconds = time_kernel(fn, x)
+            if seconds <= 0:
+                raise RuntimeError(f"Non-positive timing for {name} at {rows}x{cols}.")
+            gflops = (flops / seconds) / 1e9
+            results[name].append(((rows, cols), ai, gflops))
 
-    plt.figure(figsize=(8, 6))
-    plt.loglog(oi_vals, roofline, label="Roofline (T4)")
+    # Print Markdown table
+    print("\n| Kernel | Shape (rows, cols) | Arithmetic Intensity (FLOP/byte) | Performance (GFLOP/s) |")
+    print("|---|---:|---:|---:|")
+    for name in results:
+        for (rows, cols), ai, gflops in results[name]:
+            print(f"| {name} | ({rows}, {cols}) | {ai:.4f} | {gflops:.2f} |")
 
-    # Plot each kernel as a point at the same OI but different performance
-    for name, _, _, perf in results:
-        plt.loglog([oi], [perf], marker="o", label=name)
+    # Build roofline curve
+    all_ai = [ai for vals in results.values() for _, ai, _ in vals if ai > 0]
+    min_ai = min(all_ai)
+    max_ai = max(all_ai)
+    if min_ai == max_ai:
+        ai_left = max(min_ai * 0.7, 1e-4)
+        ai_right = max(min_ai * 1.3, ai_left * 1.1)
+    else:
+        ai_left = max(min_ai * 0.7, 1e-4)
+        ai_right = max_ai * 1.3
 
-    plt.xlabel("Operational Intensity (FLOPs/byte)")
-    plt.ylabel("Performance (FLOPs/s)")
-    plt.title("Softmax Roofline (UCI HAR output size)")
-    plt.grid(True, which="both", ls="--", alpha=0.4)
+    ai_values = [
+        ai_left * (ai_right / ai_left) ** (i / 99)
+        for i in range(100)
+    ]
+    bandwidth_line = [bandwidth_gb_s * ai for ai in ai_values]
+    # Plot ceilings and kernel points
+    plt.figure(figsize=(9, 6))
+    plt.plot(
+        ai_values,
+        bandwidth_line,
+        color="magenta",
+        linestyle="--",
+        linewidth=2.5,
+        label="Bandwidth limit",
+    )
+    plt.axhline(
+        peak_gflops,
+        color="gold",
+        linestyle=":",
+        linewidth=2.5,
+        label="Peak FP32",
+    )
+
+    for name in results:
+        x_vals = [ai for _, ai, _ in results[name]]
+        y_vals = [g for _, _, g in results[name]]
+        plt.plot(x_vals, y_vals, marker="o", linewidth=1, label=name)
+
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.xlim(left=ai_left, right=ai_right)
+    plt.ylim(bottom=1)
+    plt.xlabel("Arithmetic Intensity (FLOP/byte)")
+    plt.ylabel("Performance (GFLOP/s)")
+    plt.title(f"Softmax Roofline (GPU: {device_name})")
+    plt.grid(True, which="both", alpha=0.3)
     plt.legend()
     plt.tight_layout()
     plt.savefig("softmax_roofline.png", dpi=150)

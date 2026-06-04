@@ -1,0 +1,26 @@
+name: "softmax_engine_repository"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "INPUT"
+    data_type: TYPE_FP32
+    dims: [ -1, 561 ]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT"
+    data_type: TYPE_FP32
+    dims: [ -1, 6 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+  }
+]
